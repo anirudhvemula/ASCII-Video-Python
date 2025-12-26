@@ -36,7 +36,17 @@ def get_font_bitmaps(fontsize, boldness, reverse, background, chars, font):
     for char in chars:
         if char in bitmaps:
             continue
-        w, h = font_ttf.getsize(char)
+        bbox = font_ttf.getbbox(char)
+
+        w = bbox[2] - bbox[0]
+        h = bbox[3] - bbox[1]
+
+        # Skip characters with no drawable area (e.g. space)
+        if w <= 0 or h <= 0:
+            continue
+
+
+        
         min_width, min_height = min(min_width, w), min(min_height, h)
         # Draw font character as a w x h image.
         image = Image.new('RGB', (w, h), (background,) * 3)
@@ -84,7 +94,10 @@ def draw_ascii(frame, chars, background, clip, monochrome, font_bitmaps, buffer=
     # oh -> Original height, ow -> Original width.
     oh, ow = frame.shape[:2]
     # Sample original frame at steps of font width and height.
-    frame = frame[::fh, ::fw]
+    # Force wider sampling to avoid vertical striping
+    x_step = fw
+    frame = frame[::fh, ::x_step]
+
     h, w = frame.shape[:2]
 
     if buffer is None:
@@ -118,9 +131,12 @@ def draw_ascii(frame, chars, background, clip, monochrome, font_bitmaps, buffer=
     )
 
     if clip:
-        colors = colors[:oh, :ow]
         image = image[:oh, :ow]
         buffer = buffer[:oh, :ow]
+
+        # Explicitly clear rows below original image height
+        if buffer.shape[0] > oh:
+            buffer[oh:, :, :] = background
 
     np.multiply(image, colors, out=buffer)
     np.floor_divide(buffer, 255, out=buffer)
@@ -151,26 +167,97 @@ def ascii_video(
 
     w, h = data['size']
     frame_size = (h, w, 3)
-    # Read and convert first frame to figure out frame size.
+    output_h = h
+    output_w = w
+
+    # --- FIX 2: compute vertical crop to remove letterbox bars ---
+
+    target_aspect = 16 / 9
+    current_aspect = w / h
+
+    if abs(current_aspect - target_aspect) < 0.01:
+        # Already 16:9, no crop needed
+        top_crop = 0
+        usable_height = h
+    else:
+        # Crop vertically to 16:9
+        usable_height = int(w / target_aspect)
+        top_crop = max((h - usable_height) // 2, 0)
+
+    def crop_frame(frame):
+        return frame[top_crop:top_crop + usable_height, :, :]
+
+    
     first_frame = np.frombuffer(next(video), dtype=np.uint8).reshape(frame_size)
-    first_frame = draw_ascii(first_frame, chars, background, clip, monochrome, font_bitmaps)
+    first_frame = crop_frame(first_frame)     # ← FIX 2 applied
+    
+    ascii_frame = draw_ascii(first_frame, chars, background, clip, monochrome, font_bitmaps)
+
+    # Create full-size output canvas
+    canvas = np.zeros(
+    (output_h, output_w, 3),
+    dtype=np.uint8
+    )
+
+
+    ah, aw = ascii_frame.shape[:2]
+    y0 = (output_h - ah) // 2
+    x0 = (output_w - aw) // 2
+
+    canvas[y0:y0 + ah, x0:x0 + aw] = ascii_frame
+    first_frame = canvas
+
+
+    
     # Smaller data types can speed up operations. The minimum data type required will be
     # 2^n / (255 * 8) > len(chars) where n = 16 or 32.
-    buffer = np.empty_like(first_frame, dtype=np.uint16 if len(chars) < 32 else np.uint32)
+    # Buffer must match ASCII frame size, NOT canvas size
+    ascii_h, ascii_w = ascii_frame.shape[:2]
+    buffer = np.empty(
+        (ascii_h, ascii_w, 3),
+        dtype=np.uint16 if len(chars) < 32 else np.uint32
+    )
+
+    
     h, w = first_frame.shape[:2]
 
     kwargs = {'fps': data['fps'], 'quality': int(min(max(quality, 0), 10))}
     if audio:
         kwargs['audio_path'] = filename
 
-    writer = imageio_ffmpeg.write_frames(output, (w, h), **kwargs)
+    out_h, out_w = first_frame.shape[:2]
+    writer = imageio_ffmpeg.write_frames(output, (out_w, out_h), **kwargs)
+
     writer.send(None)
     writer.send(first_frame)
     del first_frame
 
     for frame in ProgressBar(video, total=int(data['fps'] * data['duration'] - 0.5)):
         frame = np.frombuffer(frame, dtype=np.uint8).reshape(frame_size)
-        writer.send(draw_ascii(frame, chars, background, clip, monochrome, font_bitmaps, buffer))
+        frame = crop_frame(frame)
+
+        ascii_frame = draw_ascii(
+            frame,
+            chars,
+            background,
+            clip,
+            monochrome,
+            font_bitmaps,
+            buffer
+        )
+
+        canvas = np.zeros(
+        (output_h, output_w, 3),
+        dtype=np.uint8
+        )
+
+
+        ah, aw = ascii_frame.shape[:2]
+        y0 = (output_h - ah) // 2
+        x0 = (output_w - aw) // 2
+
+        canvas[y0:y0 + ah, x0:x0 + aw] = ascii_frame
+        writer.send(canvas)
 
     writer.close()
 
@@ -199,7 +286,7 @@ def parse_args():
     parser.add_argument('filename', help='File name of the input image.')
     parser.add_argument('output', help='File name of the output image.')
 
-    parser.add_argument('-chars', '--characters', help='ASCII chars to use in media.', default='@%#*+=-:. ')
+    parser.add_argument('-chars', '--characters', help='ASCII chars to use in media.', default='.:-=+*#%@')
     parser.add_argument('-r', '--reverse', help='Reverse the character order.', action='store_true')
     parser.add_argument('-f', '--fontsize', help='Font size.', type=int, default=20)
     parser.add_argument('-b', '--bold', help='Boldness of characters. Recommended: 1/10 font size.', type=int, default=2)
@@ -214,9 +301,11 @@ def parse_args():
 
 
 def convert_ascii(args, filename, output, chars, monochrome):
-    try:
-        imageio.imread(filename)
-    except Exception:
+    ext = os.path.splitext(filename.lower())[1]
+
+    video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".gif"}
+
+    if ext in video_exts:
         ascii_video(
             filename,
             output,
@@ -244,7 +333,6 @@ def convert_ascii(args, filename, output, chars, monochrome):
             args.clip,
             args.font,
         )
-
 
 def main():
     args = parse_args()
